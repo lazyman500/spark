@@ -41,6 +41,7 @@ import org.apache.spark.sql.sources.DescribeCommand
 import org.apache.spark.sql.hive.execution.{HiveNativeCommand, DropTable, AnalyzeTable, HiveScriptIOSchema}
 import org.apache.spark.sql.types._
 import org.apache.spark.util.random.RandomSampler
+import java.util.concurrent.atomic.AtomicInteger
 
 /* Implicit conversions */
 import scala.collection.JavaConversions._
@@ -594,7 +595,8 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
             clusterByClause ::
             distributeByClause ::
             limitClause ::
-            lateralViewClause :: Nil) = {
+            lateralViewClause ::
+            windowClause :: Nil) = {
           getClauses(
             Seq(
               "TOK_INSERT_INTO",
@@ -612,7 +614,8 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
               "TOK_CLUSTERBY",
               "TOK_DISTRIBUTEBY",
               "TOK_LIMIT",
-              "TOK_LATERAL_VIEW"),
+              "TOK_LATERAL_VIEW",
+              "WINDOW"),
             singleInsert)
         }
  
@@ -620,7 +623,9 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
           case Some(f) => nodeToRelation(f)
           case None => NoRelation
         }
- 
+
+        collectWindowDefs(windowClause)
+
         val withWhere = whereClause.map { whereNode =>
           val Seq(whereExpr) = whereNode.getChildren.toSeq
           Filter(nodeToExpr(whereExpr), relations)
@@ -738,8 +743,10 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
               case Token("TOK_CUBE_GROUPBY", children) =>
                 Cube(children.map(nodeToExpr), withLateralView, selectExpressions)
               case _ => sys.error("Expect WITH CUBE")
-            }), 
-            Some(Project(selectExpressions, withLateralView))).flatten.head
+            }),
+            Some(Project(selectExpressions,
+              windowToPlan(selectExpressions, withLateralView)))).flatten.head
+
         }
 
         val withDistinct =
@@ -1006,6 +1013,130 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
       throw new NotImplementedError(s"No parse rules for:\n ${dumpTree(a).toString} ")
   }
 
+  protected val windowDefs = new ThreadLocal[Map[String, Seq[ASTNode]]] {
+    override def initialValue() = Map.empty[String, Seq[ASTNode]]
+  }
+
+  protected val nextWindowSpecId: AtomicInteger = new AtomicInteger(0)
+
+  protected def collectWindowDefs(windowClause: Option[Node]) = {
+    val definitions = windowClause.toSeq.flatMap(_.getChildren.toSeq).collect {
+      case Token("TOK_WINDOWDEF", Token(alias, Nil) :: Token("TOK_WINDOWSPEC", spec) :: Nil) =>
+        alias -> spec
+    }.toMap
+
+    windowDefs.set(definitions)
+  }
+
+  protected def substituteWindowSpec(windowSpec: Seq[ASTNode]): Seq[ASTNode] = {
+    windowSpec match {
+      case Token(alias, Nil) :: Nil =>
+        substituteWindowSpec(getWindowSpec(alias))
+
+      case Token(alias, Nil) :: frame =>
+        val (partitionClause :: _ /* range frame */ :: _ /* value frame */ :: Nil) = getClauses(
+          Seq(
+            "TOK_PARTITIONINGSPEC",
+            "TOK_WINDOWRANGE",
+            "TOK_WINDOWVALUES"),
+          substituteWindowSpec(getWindowSpec(alias)))
+
+        partitionClause
+          .map(_.asInstanceOf[ASTNode] :: frame)
+          .getOrElse(frame)
+
+      case e =>
+        e
+    }
+  }
+
+  protected def getWindowSpec(alias: String): Seq[ASTNode] = {
+    windowDefs.get().getOrElse(alias, sys.error(s"No window named $alias found."))
+  }
+
+  protected def windowToPlan(
+                              selectExpressions: Seq[NamedExpression],
+                              withLateralView: LogicalPlan): LogicalPlan = {
+    val windowExpressions = selectExpressions.flatMap(_.collect { case a: WindowExpression => a })
+    val attributes = selectExpressions.flatMap(_.collect {
+      case a: UnresolvedAttribute => a: NamedExpression
+    })
+
+    val windowPartitions = windowExpressions.map(_.windowSpec.windowPartition).distinct
+    val (restWindowExpressions, _, withWindow) =
+      windowPartitions.foldLeft((windowExpressions, attributes, withLateralView)) {
+        case ((expressions, propagatedAttrs, plan), part @ WindowPartition(partitionBy, sortBy)) =>
+          val (computeExpressions, restWindowExpressions) =
+            expressions.partition(_.windowSpec.windowPartition == part)
+
+          val withWindowPartition = (partitionBy, sortBy) match {
+            case (Nil, Nil) => plan
+            case (Nil, s)   => Sort(s, false, plan)
+            case (p, Nil)   => Repartition(p, plan)
+            case (p, s)     => SortPartitions(s, Repartition(p, plan))
+          }
+
+          val otherExpressions = (propagatedAttrs ++ (partitionBy ++ sortBy.map(_.child)).collect {
+            case a: UnresolvedAttribute => a
+          }).distinct
+
+          (restWindowExpressions, propagatedAttrs ++ computeExpressions.map(_.toAttribute),
+            WindowAggregate(partitionBy, computeExpressions, otherExpressions, withWindowPartition))
+      }
+
+    assert(restWindowExpressions.isEmpty)
+
+    withWindow
+  }
+
+  protected def parseWindowSpec(windowSpec: Seq[ASTNode]): WindowSpec = {
+    val (partitionClause :: rowsFrame :: valueFrame :: Nil) = getClauses(
+      Seq(
+        "TOK_PARTITIONINGSPEC",
+        "TOK_WINDOWRANGE",
+        "TOK_WINDOWVALUES"),
+      substituteWindowSpec(windowSpec))
+
+    val windowPartition = partitionClause.map { partition =>
+      val (orderByClause :: sortByClause :: distributeByClause :: clusterByClause :: Nil) =
+        getClauses(
+          Seq(
+            "TOK_ORDERBY",
+            "TOK_SORTBY",
+            "TOK_DISTRIBUTEBY",
+            "TOK_CLUSTERBY"),
+          partition.getChildren.toSeq.asInstanceOf[Seq[ASTNode]])
+
+      val partitionBy = distributeByClause.orElse(clusterByClause).toSeq
+      val sortBy = orderByClause.orElse(sortByClause).toSeq
+
+      WindowPartition(
+        partitionBy.flatMap(_.getChildren.map(nodeToExpr)),
+        sortBy.flatMap(_.getChildren.map(nodeToSortOrder)))
+    }.getOrElse(WindowPartition(Nil, Nil))
+
+    val maybeWindowFrame = rowsFrame.orElse(valueFrame).flatMap { frame =>
+      val ranges = frame.getChildren.toList
+      val frameType = rowsFrame.map(_ => RowsFrame).getOrElse(ValueFrame)
+
+      def nodeToBound(node: Node) = node match {
+        case Token("preceding" | "following", Token(count, Nil) :: Nil) =>
+          if (count == "unbounded") Int.MaxValue else count.toInt
+        case _ => 0
+      }
+
+      ranges match {
+        case precedingNode :: followingNode :: _ =>
+          Some(WindowFrame(frameType, nodeToBound(precedingNode), nodeToBound(followingNode)))
+        case precedingNode :: Nil =>
+          Some(WindowFrame(frameType, nodeToBound(precedingNode), 0))
+        case Nil =>
+          None
+      }
+    }
+
+    WindowSpec(windowPartition, maybeWindowFrame)
+  }
 
   protected val escapedIdentifier = "`([^`]+)`".r
   /** Strips backticks from ident if present */
@@ -1070,6 +1201,9 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
     /* Aggregate Functions */
     case Token("TOK_FUNCTION", Token(AVG(), Nil) :: arg :: Nil) => Average(nodeToExpr(arg))
     case Token("TOK_FUNCTION", Token(COUNT(), Nil) :: arg :: Nil) => Count(nodeToExpr(arg))
+    case Token("TOK_FUNCTION",Token(COUNT(), Nil) :: arg :: Token("TOK_WINDOWSPEC", spec) :: Nil) =>
+      val count = Count(nodeToExpr(arg))
+      WindowExpression(count, s"w_${nextWindowSpecId.getAndIncrement}", parseWindowSpec(spec))()
     case Token("TOK_FUNCTIONSTAR", Token(COUNT(), Nil) :: Nil) => Count(Literal(1))
     case Token("TOK_FUNCTIONDI", Token(COUNT(), Nil) :: args) => CountDistinct(args.map(nodeToExpr))
     case Token("TOK_FUNCTION", Token(SUM(), Nil) :: arg :: Nil) => Sum(nodeToExpr(arg))
@@ -1203,8 +1337,12 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
     case Token("TOK_FUNCTION", Token(COALESCE(), Nil) :: list) => Coalesce(list.map(nodeToExpr))
 
     /* UDFs - Must be last otherwise will preempt built in functions */
-    case Token("TOK_FUNCTION", Token(name, Nil) :: args) =>
-      UnresolvedFunction(name, args.map(nodeToExpr))
+    case Token("TOK_FUNCTION", Token(name, Nil) :: tail) =>
+      val (specNodes, argNodes) = tail.partition(_.getText == "TOK_WINDOWSPEC")
+      val maybeWindowSpec = specNodes.collectFirst { case Token(_, spec) => parseWindowSpec(spec) }
+      val function = UnresolvedFunction(name, argNodes.map(nodeToExpr))
+      maybeWindowSpec.map(WindowExpression(function, s"w_${nextWindowSpecId.getAndIncrement}", _)())
+        .getOrElse(function)
     case Token("TOK_FUNCTIONSTAR", Token(name, Nil) :: args) =>
       UnresolvedFunction(name, UnresolvedStar(None) :: Nil)
 
