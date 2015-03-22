@@ -29,7 +29,7 @@ import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
  *               alias. Auto-assigned if left blank.
  */
 case class WindowExpression(child: Expression, name: String, windowSpec: WindowSpec)
-                           (val exprId: ExprId = NamedExpression.newExprId, val qualifiers: Seq[String] = Nil)
+              (val exprId: ExprId = NamedExpression.newExprId, val qualifiers: Seq[String] = Nil)
   extends NamedExpression with trees.UnaryNode[Expression] {
 
   override type EvaluatedType = Any
